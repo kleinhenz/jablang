@@ -10,6 +10,9 @@ from jaxtyping import Array, Float, Int
 from functools import partial
 import numpy as np
 import ablang
+import ablang2.models.ablang2.ablang as ablang2_ablang
+import ablang2.models.ablang2.encoderblock as ablang2_encoderblock
+import rotary_embedding_torch
 
 @singledispatch
 def from_torch(x):
@@ -382,6 +385,215 @@ class AbLang(eqx.Module):
     @staticmethod
     def from_torch(m: ablang.AbLang):
         return AbLang(
+            rep=from_torch(m.AbRep),
+            head=from_torch(m.AbHead),
+        )
+
+
+# ============================================================
+# ablang2 modules
+# ============================================================
+
+
+def rotate_half(x):
+    x = einops.rearrange(x, '... (d r) -> ... d r', r=2)
+    x1, x2 = x[..., 0], x[..., 1]
+    x = jnp.stack((-x2, x1), axis=-1)
+    return einops.rearrange(x, '... d r -> ... (d r)')
+
+
+@register_from_torch(ablang2_encoderblock.SwiGLU)
+class SwiGLU(eqx.Module):
+    def __call__(self, x):
+        x, gate = jnp.split(x, 2, axis=-1)
+        return jax.nn.silu(gate) * x
+
+    @staticmethod
+    def from_torch(m):
+        return SwiGLU()
+
+
+from_torch.register(ablang2_encoderblock.SwiGLU, SwiGLU.from_torch)
+
+
+@register_from_torch(rotary_embedding_torch.RotaryEmbedding)
+class RotaryEmbedding(eqx.Module):
+    freqs: Float[Array, "D"]
+
+    def get_freqs(self, seq_len):
+        t = jnp.arange(seq_len, dtype=self.freqs.dtype)
+        freqs = jnp.outer(t, self.freqs)
+        return einops.repeat(freqs, '... n -> ... (n r)', r=2)
+
+    def apply(self, t, seq_len):
+        freqs = self.get_freqs(seq_len)
+        return t * jnp.cos(freqs) + rotate_half(t) * jnp.sin(freqs)
+
+    @staticmethod
+    def from_torch(m: rotary_embedding_torch.RotaryEmbedding):
+        return RotaryEmbedding(freqs=from_torch(m.freqs))
+
+
+@register_from_torch(ablang2_encoderblock.MultiHeadAttention)
+class AbLang2MHA(eqx.Module):
+    q_proj: Linear
+    k_proj: Linear
+    v_proj: Linear
+    out_proj: Linear
+    rotary_emb: RotaryEmbedding
+    num_heads: int
+    head_dim: int
+    scaling: float
+
+    def __call__(self, x, padding_mask=None):
+        B, N, _ = x.shape
+        q = self.q_proj(x) * self.scaling
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        q = einops.rearrange(q, 'b n (h d) -> b h n d', h=self.num_heads)
+        k = einops.rearrange(k, 'b n (h d) -> b h n d', h=self.num_heads)
+        v = einops.rearrange(v, 'b n (h d) -> b h n d', h=self.num_heads)
+
+        q = self.rotary_emb.apply(q, N)
+        k = self.rotary_emb.apply(k, N)
+
+        attn_weights = einops.einsum(q, k, 'b h n d, b h m d -> b h n m')
+        attn_weights = attn_weights / jnp.sqrt(self.head_dim).astype(attn_weights.dtype)
+
+        if padding_mask is not None:
+            mask = einops.rearrange(padding_mask, 'b n -> b 1 1 n')
+            attn_weights = jnp.where(mask, float('-inf'), attn_weights)
+
+        attn_weights = jax.nn.softmax(attn_weights, axis=-1)
+        attn = einops.einsum(attn_weights, v, 'b h n m, b h m d -> b h n d')
+        attn = einops.rearrange(attn, 'b h n d -> b n (h d)')
+        return self.out_proj(attn)
+
+    @staticmethod
+    def from_torch(m: ablang2_encoderblock.MultiHeadAttention):
+        assert m.attention_dropout.training is False
+        return AbLang2MHA(
+            q_proj=from_torch(m.q_proj),
+            k_proj=from_torch(m.k_proj),
+            v_proj=from_torch(m.v_proj),
+            out_proj=from_torch(m.out_proj),
+            rotary_emb=from_torch(m.rotary_emb),
+            num_heads=m.num_heads,
+            head_dim=m.head_dim,
+            scaling=m.scaling,
+        )
+
+
+@register_from_torch(ablang2_encoderblock.TransformerEncoder)
+class AbLang2TransformerEncoder(eqx.Module):
+    multihead_attention: AbLang2MHA
+    intermediate_layer: Sequential
+    pre_attn_layer_norm: LayerNorm
+    final_layer_norm: LayerNorm
+
+    def __call__(self, x, padding_mask=None):
+        residual = x
+        x = self.pre_attn_layer_norm(x)
+        x = self.multihead_attention(x, padding_mask=padding_mask)
+        x = residual + x
+
+        residual = x
+        x = self.final_layer_norm(x)
+        x = self.intermediate_layer(x)
+        x = residual + x
+        return x
+
+    @staticmethod
+    def from_torch(m: ablang2_encoderblock.TransformerEncoder):
+        return AbLang2TransformerEncoder(
+            multihead_attention=from_torch(m.multihead_attention),
+            intermediate_layer=from_torch(m.intermediate_layer),
+            pre_attn_layer_norm=from_torch(m.pre_attn_layer_norm),
+            final_layer_norm=from_torch(m.final_layer_norm),
+        )
+
+
+class AbLang2EncoderBlocks(eqx.Module):
+    layer_params: AbLang2TransformerEncoder
+    layer_static: AbLang2TransformerEncoder
+
+    def __call__(self, x, padding_mask=None):
+        def body(x, params):
+            layer = eqx.combine(self.layer_static, params)
+            x = layer(x, padding_mask=padding_mask)
+            return x, None
+
+        final_state, _ = jax.lax.scan(body, x, self.layer_params)
+        return final_state
+
+    @staticmethod
+    def from_torch(blocks_list):
+        blocks = [from_torch(b) for b in blocks_list]
+        block_params = jax.tree.map(
+            lambda *v: jnp.stack(v),
+            *[eqx.filter(b, eqx.is_inexact_array) for b in blocks],
+        )
+        block_static = eqx.partition(blocks[0], eqx.is_inexact_array)[1]
+        return AbLang2EncoderBlocks(
+            layer_params=block_params,
+            layer_static=block_static,
+        )
+
+
+@register_from_torch(ablang2_ablang.AbRep)
+class AbLang2AbRep(eqx.Module):
+    aa_embed_layer: Embedding
+    encoder_blocks: AbLang2EncoderBlocks
+    layer_norm: LayerNorm
+    pad_token: int
+
+    def __call__(self, tokens: Int[Array, "B N"]):
+        padding_mask = tokens == self.pad_token
+        x = self.aa_embed_layer(tokens)
+        x = self.encoder_blocks(x, padding_mask=padding_mask)
+        return self.layer_norm(x)
+
+    @staticmethod
+    def from_torch(m: ablang2_ablang.AbRep):
+        return AbLang2AbRep(
+            aa_embed_layer=from_torch(m.aa_embed_layer),
+            encoder_blocks=AbLang2EncoderBlocks.from_torch(m.encoder_blocks),
+            layer_norm=from_torch(m.layer_norm_after_encoder_blocks),
+            pad_token=m.padding_tkn,
+        )
+
+
+@register_from_torch(ablang2_ablang.AbHead)
+class AbLang2AbHead(eqx.Module):
+    ff: Sequential
+    weight: Float[Array, "Vocab Hidden"]
+    bias: Float[Array, "Vocab"]
+
+    def __call__(self, x):
+        x = self.ff(x)
+        return einops.einsum(x, self.weight, '... h, v h -> ... v') + self.bias
+
+    @staticmethod
+    def from_torch(m: ablang2_ablang.AbHead):
+        return AbLang2AbHead(
+            ff=from_torch(m.ff),
+            weight=from_torch(m.weights),
+            bias=from_torch(m.bias),
+        )
+
+
+@register_from_torch(ablang2_ablang.AbLang)
+class AbLang2(eqx.Module):
+    rep: AbLang2AbRep
+    head: AbLang2AbHead
+
+    def __call__(self, tokens: Int[Array, "B N"]):
+        return self.head(self.rep(tokens))
+
+    @staticmethod
+    def from_torch(m: ablang2_ablang.AbLang):
+        return AbLang2(
             rep=from_torch(m.AbRep),
             head=from_torch(m.AbHead),
         )

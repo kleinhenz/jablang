@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "ablang>=0.3.1",
+    "ablang2>=0.2.1",
     "einops>=0.8.0",
     "equinox>=0.12.1",
     "jax>=0.5.3",
@@ -21,4 +22,7 @@ package = true
 [dependency-groups]
 jax-cuda = [
   "jax[cuda]",
+]
+dev = [
+    "pytest>=9.0.3",
 ]
