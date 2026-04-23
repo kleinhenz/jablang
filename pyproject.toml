@@ -17,3 +17,8 @@ dependencies = [
 
 [tool.uv]
 package = true
+
+[dependency-groups]
+jax-cuda = [
+  "jax[cuda]",
+]
