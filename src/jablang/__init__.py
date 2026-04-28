@@ -28,7 +28,7 @@ from_torch.register(type(None), lambda x: x)
 from_torch.register(tuple, lambda x: tuple(map(from_torch, x)))
 from_torch.register(dict, lambda x: {k: from_torch(v) for k, v in x.items()})
 from_torch.register(torch.nn.ReLU, lambda _: jax.nn.relu)
-from_torch.register(torch.nn.GELU, lambda _: jax.nn.gelu)
+from_torch.register(torch.nn.GELU, lambda _: partial(jax.nn.gelu, approximate=False))
 from_torch.register(torch.nn.Sigmoid, lambda _: jax.nn.sigmoid)
 from_torch.register(torch.nn.SiLU, lambda _: jax.nn.silu)
 from_torch.register(torch.nn.ModuleList, lambda x: [from_torch(m) for m in x])
@@ -211,7 +211,7 @@ class AbHead(eqx.Module):
     decoder: Linear
 
     def __call__(self, features):
-        x = jax.nn.gelu(self.dense(features))
+        x = jax.nn.gelu(self.dense(features), approximate=False)
         return self.decoder(self.layer_norm(x))
 
     @staticmethod
@@ -287,7 +287,7 @@ class IntermediateLayer(eqx.Module):
 
     def __call__(self, input):
         x = self.expand_dense(input)
-        x = jax.nn.gelu(x)
+        x = jax.nn.gelu(x, approximate=False)
         x = self.dense_dense(x)
         return self.layer_norm(x + input)
 
